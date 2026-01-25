@@ -9,6 +9,7 @@
   "homepage": "https://github.com/foxriver76/ioBroker.ocpp",
   "license": "MIT",
   "keywords": [
+    "ioBroker",
     "wallbox",
     "ocpp",
     "energy"

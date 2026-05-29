@@ -183,10 +183,9 @@
     ],
     "connectionType": "local",
     "dataSource": "push",
-    "materialize": true,
     "dependencies": [
       {
-        "js-controller": ">=3.3.15"
+        "js-controller": ">=6.0.11"
       }
     ],
     "globalDependencies": [

@@ -273,6 +273,7 @@ class Ocpp extends utils.Adapter {
             this.server = new OcppServer({
                 validateConnection,
                 supportedProtocols: ['ocpp1.6'],
+                adapter: this,
             });
 
             const port = await this.getPortAsync(this.config.port);

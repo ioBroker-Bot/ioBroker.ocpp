@@ -2,6 +2,7 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import type { Socket } from 'node:net';
 import { randomUUID } from 'node:crypto';
+import { clearTimeout as cancelTimeout, setTimeout as scheduleTimeout } from 'node:timers';
 import WebSocket from 'ws';
 import type {
     OcppCallErrorFrame,
@@ -32,13 +33,15 @@ export interface OcppServerOptions {
     tlsOptions?: https.ServerOptions;
     /** Supported OCPP subprotocols (default: ['ocpp1.6']) */
     supportedProtocols?: OcppProtocolVersion[];
+    /** Adapter instance whose setTimeout/clearTimeout is used for CALL timeouts */
+    adapter?: Pick<ioBroker.Adapter, 'setTimeout' | 'clearTimeout'>;
 }
 
 interface PendingCall {
     action: string;
     resolve: (payload: unknown) => void;
     reject: (error: Error) => void;
-    timeout: NodeJS.Timeout;
+    timeout: unknown;
 }
 
 export class OcppError extends Error {
@@ -61,6 +64,7 @@ export class OcppClientConnection {
     public readonly protocol: OcppProtocolVersion;
     private readonly ws: WebSocket;
     private readonly callTimeoutMs: number;
+    private readonly adapter?: Pick<ioBroker.Adapter, 'setTimeout' | 'clearTimeout'>;
     private readonly pendingCalls: Map<string, PendingCall> = new Map();
     /** Serializes outgoing CALL messages per OCPP-J specification (max 1 in-flight CALL at a time) */
     private sendQueue: Promise<unknown> = Promise.resolve();
@@ -69,11 +73,18 @@ export class OcppClientConnection {
     public onError?: (action: string | undefined, error: Error) => void;
     public onClose?: (code: number, reason: string) => void;
 
-    public constructor(ws: WebSocket, url: string, protocol: OcppProtocolVersion, callTimeoutMs = 30_000) {
+    public constructor(
+        ws: WebSocket,
+        url: string,
+        protocol: OcppProtocolVersion,
+        callTimeoutMs = 30_000,
+        adapter?: Pick<ioBroker.Adapter, 'setTimeout' | 'clearTimeout'>,
+    ) {
         this.ws = ws;
         this.url = url;
         this.protocol = protocol;
         this.callTimeoutMs = callTimeoutMs;
+        this.adapter = adapter;
 
         this.ws.on('message', (data: WebSocket.Data) => {
             void this.handleRawMessage(data);
@@ -133,7 +144,7 @@ export class OcppClientConnection {
         const frame: OcppCallFrame = [OCPP_MESSAGE_TYPE.CALL, messageId, action, cleanPayload];
 
         return new Promise<TRes>((resolve, reject) => {
-            const timeout = this.setTimeout(() => {
+            const timeout = this.scheduleCallTimeout(() => {
                 this.pendingCalls.delete(messageId);
                 reject(new Error(`Timeout waiting for response to "${action}" (messageId: ${messageId})`));
             }, this.callTimeoutMs);
@@ -147,7 +158,7 @@ export class OcppClientConnection {
 
             this.ws.send(JSON.stringify(frame), err => {
                 if (err) {
-                    this.clearTimeout(timeout);
+                    this.clearCallTimeout(timeout);
                     this.pendingCalls.delete(messageId);
                     reject(err);
                 }
@@ -187,7 +198,7 @@ export class OcppClientConnection {
 
     private rejectAllPending(error: Error): void {
         for (const [messageId, pending] of this.pendingCalls.entries()) {
-            this.clearTimeout(pending.timeout);
+            this.clearCallTimeout(pending.timeout);
             pending.reject(error);
             this.pendingCalls.delete(messageId);
         }
@@ -281,7 +292,7 @@ export class OcppClientConnection {
         if (!pending) {
             return;
         }
-        this.clearTimeout(pending.timeout);
+        this.clearCallTimeout(pending.timeout);
         this.pendingCalls.delete(messageId);
         pending.resolve(payload);
     }
@@ -302,7 +313,7 @@ export class OcppClientConnection {
             this.onError?.(undefined, error);
             return;
         }
-        this.clearTimeout(pending.timeout);
+        this.clearCallTimeout(pending.timeout);
         this.pendingCalls.delete(messageId);
         pending.reject(error);
     }
@@ -339,22 +350,29 @@ export class OcppClientConnection {
     }
 
     /**
-     * Timer helper matching ioBroker repochecker pattern
+     * Schedules an outgoing CALL timeout using the adapter timer when available
      *
      * @param callback timer callback function
      * @param ms delay in milliseconds
      */
-    private setTimeout(callback: () => void, ms: number): NodeJS.Timeout {
-        return global.setTimeout(callback, ms);
+    private scheduleCallTimeout(callback: () => void, ms: number): unknown {
+        if (this.adapter) {
+            return this.adapter.setTimeout(callback, ms);
+        }
+        return scheduleTimeout(callback, ms);
     }
 
     /**
-     * Clears an active timer
+     * Clears an active outgoing CALL timer
      *
      * @param timeout timer reference
      */
-    private clearTimeout(timeout: NodeJS.Timeout): void {
-        global.clearTimeout(timeout);
+    private clearCallTimeout(timeout: unknown): void {
+        if (this.adapter) {
+            this.adapter.clearTimeout(timeout as ioBroker.Timeout | undefined);
+            return;
+        }
+        cancelTimeout(timeout as NodeJS.Timeout);
     }
 }
 
@@ -538,7 +556,13 @@ export class OcppServer {
                 this.activeClients.delete(url);
             }
 
-            const client = new OcppClientConnection(ws, url, negotiatedProtocol, this.options.callTimeoutMs ?? 30_000);
+            const client = new OcppClientConnection(
+                ws,
+                url,
+                negotiatedProtocol,
+                this.options.callTimeoutMs ?? 30_000,
+                this.options.adapter,
+            );
 
             client.onRequest = async (action, payload) => {
                 if (!this.onRequest) {
